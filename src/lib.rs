@@ -1,7 +1,18 @@
-//! Hash456: A Research-Grade 456-bit Sponge Hash Function
-//! WARNING: For educational and research purposes only. Not for production security.
+//! Hash456: 456-bit Sponge-based Hash & MAC (Research Prototype)
+//! ⚠️ WARNING: Educational/Analysis use only. Not production-safe.
 
-// ১. S-Box Lookup Table (Day 1 এর আউটপুট এখানে বসবে)
+use digest::{Update, Reset, FixedOutput, OutputSizeUser};
+use typenum::U57;
+
+// ─────────────────────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────────────────────
+const STATE_SIZE: usize = 64; // 512 bits
+const RATE: usize = 32;       // 256 bits (absorb/squeeze rate)
+const CAPACITY: usize = 32;   // 256 bits (security margin)
+const ROUNDS: usize = 24;     // Permutation rounds
+
+// AES-Style 8-bit S-Box (Non-Linearity)
 const SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -21,135 +32,168 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-// ২. Constants
-const STATE_SIZE: usize = 64; // 512 bits
-const RATE: usize = 32;       // 256 bits
-const CAPACITY: usize = 32;   // 256 bits
-const ROUNDS: usize = 24;     // Security margin
-
+// ─────────────────────────────────────────────────────────────
+// CORE STRUCT
+// ─────────────────────────────────────────────────────────────
+#[derive(Clone, Default)]
 pub struct Hash456 {
     state: [u8; STATE_SIZE],
+    buffer: Vec<u8>, // Handles unaligned updates
 }
 
 impl Hash456 {
     pub fn new() -> Self {
-        Hash456 {
+        Self {
             state: [0u8; STATE_SIZE],
+            buffer: Vec::new(),
         }
     }
-
-    // ৩. Round Function: SubBytes -> ShiftRows -> MixColumns -> AddRoundConstant
+    /// Permutation Layer (SPN: SubBytes → Shift → Mix → AddRC)
     fn permutation(&mut self, round_idx: usize) {
-        // A. SubBytes (Non-Linearity)
+        // 1. SubBytes
         for i in 0..STATE_SIZE {
             self.state[i] = SBOX[self.state[i] as usize];
         }
-
-        // B. ShiftRows / Rotate State (Diffusion Step 1)
-        // Simple rotation based on round index to break symmetry
-        let rot = round_idx % 8;        self.state.rotate_left(rot);
-
-        // C. MixColumns (Linear Diffusion over GF(2^8))
-        // We treat state as 16 columns of 4 bytes each (simplified MDS)
-        // For full MDS, implement matrix multiplication. Here using XOR-shift for speed/demo.
-        // Real research code needs proper MDS matrix mult.
+        // 2. Rotate State (Breaks word alignment)
+        let rot = round_idx % 8;
+        self.state.rotate_left(rot);
+        // 3. Simplified MDS-like Diffusion
         for i in (0..STATE_SIZE).step_by(4) {
-            let t = self.state[i] ^ self.state[i+1] ^ self.state[i+2] ^ self.state[i+3];
-            self.state[i]   ^= t ^ ((t << 1) & 0xFF) ^ ((t >> 7) & 0x01); // Simplified diffusion
-            self.state[i+1] ^= t;
-            self.state[i+2] ^= t;
-            self.state[i+3] ^= t;
+            let t = self.state[i] ^ self.state[i + 1] ^ self.state[i + 2] ^ self.state[i + 3];
+            self.state[i]     ^= t ^ ((t << 1) & 0xFF) ^ ((t >> 7) & 0x01);
+            self.state[i + 1] ^= t;
+            self.state[i + 2] ^= t;
+            self.state[i + 3] ^= t;
         }
-
-        // D. Add Round Constant (Symmetry Breaking)
-        // Using a simple LFSR generated constant sequence
-        let rc = ((round_idx + 1) as u8).wrapping_mul(0x9E); 
+        // 4. Add Round Constant (Symmetry breaking)
+        let rc = ((round_idx + 1) as u8).wrapping_mul(0x9E);
         self.state[0] ^= rc;
         self.state[1] ^= (rc << 1) | (rc >> 7);
     }
 
-    // ৪. Absorb Phase
-    pub fn absorb(&mut self, data: &[u8]) {
-        let mut buffer = data.to_vec();
-        
-        // Padding: 10*1 rule (Keccak style)
-        buffer.push(0x01);
-        while buffer.len() % RATE != 0 {
-            buffer.push(0x00);
+    /// Internal block absorb (must be exactly RATE bytes)
+    fn absorb_block(&mut self, block: &[u8]) {
+        debug_assert_eq!(block.len(), RATE);
+        for i in 0..RATE {
+            self.state[i] ^= block[i];
         }
-        buffer[buffer.len() - 1] |= 0x80; // Set last bit of last byte
-
-        // Process blocks
-        for chunk in buffer.chunks(RATE) {
-            // XOR input into rate part of state
-            for i in 0..RATE {
-                self.state[i] ^= chunk[i];
-            }
-            // Permute
-            for r in 0..ROUNDS {
-                self.permutation(r);
-            }
+        for r in 0..ROUNDS {
+            self.permutation(r);
         }
     }
 
-    // ৫. Squeeze Phase (Output 456 bits = 57 bytes)
+    /// Applies padding & finalizes internal state
+    fn finalize_internal(&mut self) {
+        let mut padded = self.buffer.clone();
+        padded.push(0x01); // Start padding
+        while padded.len() % RATE != 0 {
+            padded.push(0x00);
+        }
+        padded[padded.len() - 1] |= 0x80; // End padding marker
+
+        for chunk in padded.chunks(RATE) {
+            self.absorb_block(chunk);
+        }
+        self.buffer.clear();
+    }
+    /// 🔑 Keyed Sponge MAC Generation (Native Mode)
+    /// Domain Separator: 0x01 ensures Key/Message boundary
+    pub fn hash_keyed(key: &[u8], message: &[u8]) -> [u8; 57] {
+        let mut h = Self::new();
+        h.absorb(key);
+        h.absorb(&[0x01]); // Domain separation
+        h.absorb(message);
+        h.squeeze()
+    }
+
+    /// Extracts 456-bit (57-byte) output
     pub fn squeeze(&mut self) -> [u8; 57] {
-        let mut output = [0u8; 57];
+        let mut out = [0u8; 57];
         let mut offset = 0;
         while offset < 57 {
-            let copy_len = std::cmp::min(RATE, 57 - offset);
-            output[offset..offset + copy_len].copy_from_slice(&self.state[..copy_len]);
-            offset += copy_len;
-            
+            let len = std::cmp::min(RATE, 57 - offset);
+            out[offset..offset + len].copy_from_slice(&self.state[..len]);
+            offset += len;
             if offset < 57 {
-                // Permute if more data needed
                 for r in 0..ROUNDS {
                     self.permutation(r);
                 }
             }
         }
-        output
+        out
     }
+}
 
-    // Convenience function
-    pub fn hash(data: &[u8]) -> [u8; 57] {
-        let mut h = Hash456::new();
-        h.absorb(data);
-        h.squeeze()
+// ─────────────────────────────────────────────────────────────
+// digest CRATE TRAIT IMPLEMENTATIONS
+// ─────────────────────────────────────────────────────────────
+impl OutputSizeUser for Hash456 {
+    type OutputSize = U57;
+}
+
+impl Update for Hash456 {
+    fn update(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+        while self.buffer.len() >= RATE {
+            let block: [u8; RATE] = self.buffer.drain(..RATE).collect::<Vec<_>>().try_into().unwrap();
+            self.absorb_block(&block);
+        }
     }
-  }
+}
+
+impl Reset for Hash456 {
+    fn reset(&mut self) {
+        self.state = [0u8; STATE_SIZE];
+        self.buffer.clear();
+    }}
+
+impl FixedOutput for Hash456 {
+    fn finalize_into(mut self, out: &mut digest::Output<Self>) {
+        self.finalize_internal();
+        let result = self.squeeze();
+        out.copy_from_slice(&result);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TESTS
+// ─────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
+    use digest::Digest;
 
     #[test]
-    fn test_basic_hash() {
-        let input = b"Hello Ethical Hacker";
-        let hash = Hash456::hash(input);
-        println!("Hash: {}", hex::encode(hash));
-        assert_eq!(hash.len(), 57); // Must be 456 bits
+    fn test_standard_hash() {
+        let mut hasher = Hash456::new();
+        hasher.update(b"Hello Ethical Hacker");
+        let res = hasher.finalize_fixed();
+        assert_eq!(res.len(), 57);
+        println!("Standard: {}", hex::encode(res));
     }
 
     #[test]
-    fn test_avalanche_effect() {
-        let h1 = Hash456::hash(b"Test1");
-        let h2 = Hash456::hash(b"Test2");
-        
-        let mut diff_bits = 0;
-        for i in 0..57 {
-            let xor = h1[i] ^ h2[i];
-            diff_bits += xor.count_ones();
-        }
-        // Ideal avalanche: ~50% bits change. 57 bytes * 8 bits = 456 bits.
-        // Expect approx 228 bits different. Allow range 150-300 for this simple design.
-        println!("Bits changed: {}", diff_bits);
-        assert!(diff_bits > 100, "Avalanche effect too weak");
+    fn test_keyed_mac() {
+        let tag = Hash456::hash_keyed(b"my_secret_key_32_bytes_long!!", b"secure_message");
+        assert_eq!(tag.len(), 57);
+        println!("Keyed MAC: {}", hex::encode(tag));
     }
-    
+
     #[test]
     fn test_deterministic() {
-        let h1 = Hash456::hash(b"Cisco Certified");
-        let h2 = Hash456::hash(b"Cisco Certified");
+        let h1 = Hash456::digest(b"Cisco Certified");
+        let h2 = Hash456::digest(b"Cisco Certified");
         assert_eq!(h1, h2);
     }
-}
+
+    #[test]
+    fn test_avalanche() {
+        let h1 = Hash456::digest(b"Test1");
+        let h2 = Hash456::digest(b"Test2");
+        let mut diff_bits = 0u32;
+        for i in 0..57 {
+            diff_bits += (h1[i] ^ h2[i]).count_ones();
+        }
+        println!("Avalanche: {} bits changed (ideal ~228)", diff_bits);        assert!(diff_bits > 100, "Avalanche effect too weak");
+    }
+        }
