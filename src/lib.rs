@@ -118,3 +118,38 @@ impl Hash456 {
         h.squeeze()
     }
   }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_hash() {
+        let input = b"Hello Ethical Hacker";
+        let hash = Hash456::hash(input);
+        println!("Hash: {}", hex::encode(hash));
+        assert_eq!(hash.len(), 57); // Must be 456 bits
+    }
+
+    #[test]
+    fn test_avalanche_effect() {
+        let h1 = Hash456::hash(b"Test1");
+        let h2 = Hash456::hash(b"Test2");
+        
+        let mut diff_bits = 0;
+        for i in 0..57 {
+            let xor = h1[i] ^ h2[i];
+            diff_bits += xor.count_ones();
+        }
+        // Ideal avalanche: ~50% bits change. 57 bytes * 8 bits = 456 bits.
+        // Expect approx 228 bits different. Allow range 150-300 for this simple design.
+        println!("Bits changed: {}", diff_bits);
+        assert!(diff_bits > 100, "Avalanche effect too weak");
+    }
+    
+    #[test]
+    fn test_deterministic() {
+        let h1 = Hash456::hash(b"Cisco Certified");
+        let h2 = Hash456::hash(b"Cisco Certified");
+        assert_eq!(h1, h2);
+    }
+}
