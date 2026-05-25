@@ -1,0 +1,13 @@
+[package]
+name = "hash456-research"
+version = "0.1.0"
+edition = "2021"
+description = "Research-grade 456-bit sponge hash function (Educational & Analysis Only)"
+
+[dependencies]
+digest = "0.10.7"
+typenum = "1.17.0"
+subtle = "2.5.0"
+
+[dev-dependencies]
+hex = "0.4.3"
